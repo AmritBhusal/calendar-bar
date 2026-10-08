@@ -213,3 +213,4 @@ Optional settings (put them in `~/.profile`):
 |---|---|---|
 | `CALENDAR_BAR_FONT` | `CaskaydiaCove Nerd Font 10` | popup font |
 | `CALENDAR_BAR_OFFSET` | `34` | pixels from the top of the screen to the popup |
+# calendar-bar
