@@ -1,5 +1,7 @@
 # calendar-bar
 
+[github.com/AmritBhusal/calendar-bar](https://github.com/AmritBhusal/calendar-bar)
+
 Your next Google Calendar meeting in the top bar, with a one-click **Join** button. Works with **polybar** (for example on i3).
 
 ```
@@ -66,12 +68,10 @@ If your distro has no package for `recurring-ical-events`, `pip install --user r
 **2. Get the code and run the installer:**
 
 ```bash
-git clone <repo-url> ~/Projects/calendar-bar
+git clone https://github.com/AmritBhusal/calendar-bar.git ~/Projects/calendar-bar
 cd ~/Projects/calendar-bar
 ./install.sh
 ```
-
-Replace `<repo-url>` with this repository's address, which you'll find on its page under **Code → Clone**.
 
 The installer:
 - checks that everything from step 1 is installed, and runs a quick self-test;
@@ -213,4 +213,3 @@ Optional settings (put them in `~/.profile`):
 |---|---|---|
 | `CALENDAR_BAR_FONT` | `CaskaydiaCove Nerd Font 10` | popup font |
 | `CALENDAR_BAR_OFFSET` | `34` | pixels from the top of the screen to the popup |
-# calendar-bar
