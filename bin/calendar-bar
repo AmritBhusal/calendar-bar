@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Polybar calendar / meetings widget for Google Calendar.
+
+  calendar-bar           bar label (current or next meeting today)
+  calendar-bar menu      rofi popup: day's meetings (←/→ change day), month grid to pick a date
+  calendar-bar join      open the current/imminent meeting link immediately
+  calendar-bar set-url   save your Google Calendar "Secret address in iCal format"
+  calendar-bar refresh   re-download the calendar now
+  calendar-bar selftest  run the built-in check
+
+Needs: pacman -S python-recurring-ical-events rofi libnotify xdg-utils
+Config: the secret iCal address in ~/.config/calendar-bar/ics_url (calendar-bar set-url writes it)
+
+  CALENDAR_BAR_FONT    rofi popup font (default "CaskaydiaCove Nerd Font 10")
+  CALENDAR_BAR_OFFSET  pixels from the top of the screen to the popup (default 34)
+"""
+import calendar
+import datetime as dt
+import getpass
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+URL_FILE = Path.home() / ".config/calendar-bar/ics_url"
+CACHE = Path.home() / ".cache/calendar-bar/calendar.ics"
+EVENTS = Path.home() / ".cache/calendar-bar/events.json"  # pre-parsed, so the popup opens instantly
+FONT = os.environ.get("CALENDAR_BAR_FONT", "CaskaydiaCove Nerd Font 10")
+OFFSET = int(os.environ.get("CALENDAR_BAR_OFFSET", "34"))
+LINK_RE = re.compile(
+    r"https://(?:meet\.google\.com/[a-z0-9-]+"
+    r"|[\w.-]*zoom\.us/j/[^\s\"<>\\]+"
+    r"|teams\.microsoft\.com/l/meetup-join/[^\s\"<>\\]+)"
+)
+JOIN_EARLY = dt.timedelta(minutes=10)
+
+
+def write_private(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(data)
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def fetch(max_age):
+    if not CACHE.exists() or time.time() - CACHE.stat().st_mtime > max_age:
+        try:
+            data = urllib.request.urlopen(URL_FILE.read_text().strip(), timeout=10).read()
+            write_private(CACHE, data)
+        except Exception:
+            if not CACHE.exists():
+                raise
+            # offline: stale cache beats nothing
+    return CACHE.read_bytes()
+
+
+def parse(ics):
+    import icalendar
+    import recurring_ical_events
+
+    cal = icalendar.Calendar.from_ical(ics)
+    me = "mailto:" + str(cal.get("X-WR-CALNAME", "")).lower()  # Google sets this to your email
+    return recurring_ical_events.of(cal), me
+
+
+def meetings(cal, day, days=1):
+    """[(start, end, title, link)] starting in [day, day+days), sorted."""
+    query, me = cal
+    day0 = dt.datetime.combine(day, dt.time()).astimezone()
+    out = []
+    for ev in query.between(day0, day0 + dt.timedelta(days=days)):
+        if not isinstance(ev.start, dt.datetime) or ev.get("STATUS") == "CANCELLED":
+            continue  # ponytail: all-day events aren't meetings
+        attendees = ev.get("ATTENDEE", [])
+        if not isinstance(attendees, list):
+            attendees = [attendees]
+        if any(str(a).lower() == me and a.params.get("PARTSTAT") == "DECLINED" for a in attendees):
+            continue
+        text = " ".join(str(ev.get(k, "")) for k in ("X-GOOGLE-CONFERENCE", "LOCATION", "DESCRIPTION"))
+        link = LINK_RE.search(text)
+        title = " ".join(str(ev.get("SUMMARY", "(no title)")).split())
+        out.append((ev.start.astimezone(), ev.end.astimezone(), title, link and link.group(0)))
+    return sorted(out, key=lambda m: m[0])
+
+
+def refresh(max_age=120):
+    """Re-fetch the feed if stale and rebuild EVENTS. Run by the bar every minute."""
+    fetch(max_age)
+    if not EVENTS.exists() or EVENTS.stat().st_mtime < CACHE.stat().st_mtime:
+        # ponytail: fixed window, dates outside it show as empty; widen if you browse further
+        evs = meetings(parse(CACHE.read_bytes()), dt.date.today() - dt.timedelta(days=60), 240)
+        write_private(EVENTS, json.dumps([(s.isoformat(), e.isoformat(), t, l) for s, e, t, l in evs]).encode())
+
+
+def events():
+    if not EVENTS.exists():
+        refresh()
+    f = dt.datetime.fromisoformat
+    return [(f(s), f(e), t, l) for s, e, t, l in json.loads(EVENTS.read_bytes())]
+
+
+def on(evs, day, days=1):
+    return [m for m in evs if day <= m[0].date() < day + dt.timedelta(days=days)]
+
+
+def upcoming_today():
+    now = dt.datetime.now().astimezone()
+    return [m for m in on(events(), now.date()) if m[1] > now]
+
+
+def bar():
+    if not URL_FILE.exists():
+        return print("󰃭 run: calendar-bar set-url")
+    try:
+        refresh()
+        ms = upcoming_today()
+    except Exception:
+        return print("%{F#D9534F}󰃭%{F-}")
+    now = dt.datetime.now().astimezone()
+    if not ms:
+        return print("󰃭")
+    s, _, title, link = ms[0]
+    title = (title[:25] + "…" if len(title) > 25 else title).replace("%{", "%")
+    icon = "󰤙" if link else "󰃭"
+    if s <= now + JOIN_EARLY:
+        print(f"%{{F#20C997}}{icon} {title} {'now' if s <= now else s.strftime('%I:%M%p')}%{{F-}}")
+    else:
+        print(f"%{{F#F0C674}}{icon}%{{F-}} {s:%I:%M%p} {title}")
+
+
+THEME = """
+* { font: "FONT"; background-color: transparent; text-color: #C5C8C6; }
+window { location: northeast; anchor: northeast; x-offset: -8px; y-offset: OFFSETpx; width: 300px;
+         background-color: #001C30; border: 1px; border-color: #373B41; border-radius: 8px; }
+mainbox { children: [nav, listview]; padding: 12px; spacing: 10px; }
+nav { orientation: horizontal; children: [button-prev, message, button-next]; expand: false; }
+message, textbox { border: 0; padding: 0; horizontal-align: 0.5; expand: true; }
+button-prev, button-next { expand: false; padding: 0 10px; border-radius: 4px; text-color: #F0C674;
+                           vertical-align: 0.5; cursor: pointer; }
+button-prev {
+    content: "‹";
+    action: "kb-custom-1";
+}
+button-next {
+    content: "›";
+    action: "kb-custom-2";
+}
+listview { columns: %d; lines: %d; flow: horizontal; fixed-height: false; scrollbar: false; spacing: 2px; border: 0; }
+element { padding: %s; border-radius: 6px; }
+element normal.normal, element alternate.normal { background-color: transparent; text-color: #C5C8C6; }
+element selected.normal { background-color: #373B41; text-color: #F0C674; }
+element-text { text-color: inherit; horizontal-align: %s; }
+element-icon { size: 0; }
+"""
+THEME = THEME.replace("FONT", FONT).replace("OFFSET", str(OFFSET))
+DIM = "<span alpha='45%%'>%s</span>"
+
+
+def rofi(rows, mesg, theme, selected, keys):
+    """Index picked, "prev"/"next" for the custom keys, or None if dismissed."""
+    r = subprocess.run(
+        ["rofi", "-dmenu", "-markup-rows", "-format", "i", "-no-custom",
+         "-me-select-entry", "", "-me-accept-entry", "MousePrimary",
+         *keys, "-selected-row", str(selected), "-theme-str", theme, "-mesg", mesg],
+        input="\n".join(rows), capture_output=True, text=True,
+    )
+    if r.returncode in (10, 11):
+        return ("prev", "next")[r.returncode - 10]
+    return int(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+
+
+def day_view(evs, day, today):
+    now = dt.datetime.now().astimezone()
+    ms = on(evs, day)
+    rows = []
+    for s, e, title, link in ms:
+        when = f"<span foreground='#F0C674'>{s:%I:%M%p}</span>"
+        if e <= now:
+            when = DIM % f"{s:%I:%M%p}"
+        elif s <= now:
+            when = "<span foreground='#20C997'><b>now</b>    </span>"
+        join = "  <span foreground='#20C997'>󰤙 Join</span>" if link and e > now else ""
+        rows.append(f"{when}  {html.escape(title[:28])}{join}")
+    rows = rows or [DIM % "No meetings"]
+    rows += [DIM % "󰃭  Pick a date", DIM % "  Open in Google Calendar"]
+    label = "Today" if day == today else f"{day:%A}"
+    mesg = f"<b>{label}, {day:%d %b %Y}</b>"
+    keys = ["-kb-move-char-back", "Control+b", "-kb-move-char-forward", "Control+f",
+            "-kb-custom-1", "Left", "-kb-custom-2", "Right"]
+    i = rofi(rows, mesg, THEME % (1, len(rows), "6px 8px", "0"), 0, keys)
+    if i in ("prev", "next"):
+        return "day", day + dt.timedelta(days=1 if i == "next" else -1)
+    if i is None:
+        return None
+    if i < len(ms):
+        s, _, _, link = ms[i]
+        subprocess.Popen(["xdg-open", link or f"https://calendar.google.com/calendar/r/day/{s:%Y/%m/%d}"])
+    elif i == len(rows) - 2:
+        return "month", day
+    elif i == len(rows) - 1:
+        subprocess.Popen(["xdg-open", f"https://calendar.google.com/calendar/r/day/{day:%Y/%m/%d}"])
+    return None
+
+
+def month_view(evs, day, today):
+    first = day.replace(day=1)
+    busy = {m[0].date() for m in on(evs, first - dt.timedelta(days=7), 45)}
+    dates = [d for w in calendar.Calendar().monthdatescalendar(day.year, day.month) for d in w]
+    rows = [DIM % d for d in ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")]
+    for d in dates:
+        c = f"<u>{d.day}</u>" if d in busy else str(d.day)
+        if d == today:
+            c = f"<span background='#F0C674' foreground='#001C30'><b> {d.day} </b></span>"
+        elif d.month != day.month:
+            c = DIM % c
+        rows.append(c)
+    keys = ["-kb-page-prev", "", "-kb-page-next", "",
+            "-kb-row-left", "Left", "-kb-row-right", "Right",
+            "-kb-move-char-back", "Control+b", "-kb-move-char-forward", "Control+f",
+            "-kb-custom-1", "Page_Up", "-kb-custom-2", "Page_Down"]
+    theme = THEME % (7, len(rows) // 7, "5px 0", "0.5")
+    i = rofi(rows, f"<b>{day:%B %Y}</b>", theme, 7 + dates.index(day), keys)
+    if i == "prev":
+        return "month", (first - dt.timedelta(days=1)).replace(day=1)
+    if i == "next":
+        return "month", (first + dt.timedelta(days=32)).replace(day=1)
+    if i is None:
+        return None
+    if i >= 7:
+        return "day", dates[i - 7]
+    return "month", day  # clicked a weekday header
+
+
+def menu():
+    evs = events()
+    today = dt.date.today()
+    state = ("day", today)
+    while state:
+        view, day = state
+        state = (day_view if view == "day" else month_view)(evs, day, today)
+
+
+def join():
+    now = dt.datetime.now().astimezone()
+    for s, _, _, link in upcoming_today():
+        if link and s - JOIN_EARLY <= now:
+            return subprocess.Popen(["xdg-open", link])
+    subprocess.run(["notify-send", "Meetings", "No meeting to join right now"])
+
+
+def set_url():
+    print("Google Calendar → Settings → your calendar → Integrate calendar → Secret address in iCal format")
+    url = getpass.getpass("Paste the address (hidden): ").strip()
+    if not url.startswith("https://"):
+        sys.exit("That doesn't look like an https:// address — nothing saved.")
+    write_private(URL_FILE, (url + "\n").encode())
+    CACHE.unlink(missing_ok=True)  # old calendar's data
+    EVENTS.unlink(missing_ok=True)
+    refresh()
+    print(f"Saved to {URL_FILE}. Today: {len(upcoming_today())} meeting(s) still to come.")
+
+
+def selftest():
+    now = dt.datetime(2026, 10, 7, 10, 0, tzinfo=dt.timezone.utc)
+    ics = b"""BEGIN:VCALENDAR
+VERSION:2.0
+X-WR-CALNAME:me@x.org
+BEGIN:VEVENT
+UID:1
+SUMMARY:Standup
+DTSTART:20261001T100500Z
+DTEND:20261001T102000Z
+RRULE:FREQ=DAILY
+X-GOOGLE-CONFERENCE:https://meet.google.com/abc-defg-hij
+END:VEVENT
+BEGIN:VEVENT
+UID:2
+SUMMARY:Declined
+DTSTART:20261007T110000Z
+DTEND:20261007T113000Z
+ATTENDEE;PARTSTAT=DECLINED:mailto:me@x.org
+END:VEVENT
+BEGIN:VEVENT
+UID:3
+SUMMARY:Holiday
+DTSTART;VALUE=DATE:20261007
+DTEND;VALUE=DATE:20261008
+END:VEVENT
+BEGIN:VEVENT
+UID:4
+SUMMARY:Zoom sync
+DTSTART:20261007T120000Z
+DTEND:20261007T130000Z
+DESCRIPTION:Join: https://us02web.zoom.us/j/123?pwd=x\\nbye
+END:VEVENT
+BEGIN:VEVENT
+UID:5
+SUMMARY:Done already
+DTSTART:20261007T080000Z
+DTEND:20261007T090000Z
+END:VEVENT
+END:VCALENDAR
+"""
+    cal = parse(ics)
+    ms = meetings(cal, now.date())
+    titles = [m[2] for m in ms]
+    assert titles == ["Done already", "Standup", "Zoom sync"], titles  # declined + all-day dropped
+    assert [m[2] for m in meetings(cal, dt.date(2026, 10, 9))] == ["Standup"]  # recurrence, other day
+    week = meetings(cal, dt.date(2026, 10, 1), 7)
+    assert len(week) == 7 + 2
+    assert [m[2] for m in on(week, dt.date(2026, 10, 3))] == ["Standup"]
+    ms = ms[1:]
+    assert ms[0][3] == "https://meet.google.com/abc-defg-hij"
+    assert ms[1][3] == "https://us02web.zoom.us/j/123?pwd=x", ms[1][3]
+    print("ok")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "bar"
+    try:
+        {"bar": bar, "menu": menu, "join": join, "refresh": lambda: refresh(0), "set-url": set_url,
+         "selftest": selftest}[cmd]()
+    except Exception as e:
+        if cmd in ("bar", "selftest", "set-url"):
+            raise
+        subprocess.run(["notify-send", "-u", "critical", "Meetings", str(e)])
